@@ -363,3 +363,4 @@ deployments/
 
 # === OS-specific ===
 Thumbs.db
+node_modules/
