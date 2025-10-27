@@ -324,3 +324,42 @@ TSWLatexianTemp*
 # option is specified. Footnotes are the stored in a file with suffix Notes.bib.
 # Uncomment the next line to have this generated file ignored.
 #*Notes.bib
+node_modules/
+
+# === Rust & Anchor build artifacts ===
+target/
+dist/
+*.so
+*.a
+*.dSYM
+*.rlib
+
+# === Anchor specific ===
+.anchor/
+node_modules/
+coverage/
+tmp/
+deployments/
+
+# === Solana / Keypairs ===
+*.json
+!Anchor.toml
+!package.json
+# (keep config files but ignore wallet keypairs)
+**/id.json
+**/keypair.json
+
+# === Logs and misc ===
+*.log
+*.out
+.DS_Store
+.env
+.env.local
+.idea/
+.vscode/
+.cache/
+.nyc_output/
+*.tsbuildinfo
+
+# === OS-specific ===
+Thumbs.db
