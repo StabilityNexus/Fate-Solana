@@ -3,11 +3,14 @@ use anchor_spl::{
     associated_token::AssociatedToken,
     token::{ self, Burn, Mint, MintTo, Token, TokenAccount, Transfer },
 };
+use chainlink_solana as chainlink;
+use std::str::FromStr;
 
 // -------------------------------------------------------------------------------------
 // Program ID
 // -------------------------------------------------------------------------------------
 declare_id!("72qYP28onmhJQX1en3hWCphKSer2ksivDEv6PtiYfKcM");
+
 // -------------------------------------------------------------------------------------
 // Constants
 // -------------------------------------------------------------------------------------
@@ -17,11 +20,20 @@ pub const MAX_FEE: u64 = 1_000; // 10%
 pub const MIN_PROTOCOL_FEE: u64 = 30; // 0.30%
 pub const OUTCOME_TOKEN_DECIMALS: u8 = 9; // SPL norm is 9
 pub const PRECISION_SCALE: u64 = 1_000_000_000; // same role as in Sui
-pub const STABILITY_WALLET: &str = "9JvZLhnbYpz6XJThyU5t8rVgkCjs79p7xH8CkRWniJgV";
+pub const STABILITY_WALLET: &str = "9JvZLhnbYpz6XJThyU5t8rVgkCjs79p7xH8CkRWniJg";
+
+// Chainlink OCR2 program on Solana
+// (this is the canonical Chainlink program ID published in Chainlink docs)
+pub const CHAINLINK_PROGRAM_ID_STR: &str = "HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny";
+
+pub fn chainlink_program_pubkey() -> Pubkey {
+    Pubkey::from_str(CHAINLINK_PROGRAM_ID_STR).unwrap()
+}
 
 pub fn stable_order_address() -> Pubkey {
     Pubkey::from_str(STABILITY_WALLET).unwrap()
 }
+
 // -------------------------------------------------------------------------------------
 // Errors
 // -------------------------------------------------------------------------------------
@@ -44,6 +56,7 @@ pub enum PredictionError {
     #[msg("Zero price")]
     ZeroPrice,
 }
+
 // -------------------------------------------------------------------------------------
 // On-chain State
 // -------------------------------------------------------------------------------------
@@ -60,25 +73,22 @@ pub struct PoolAccount {
     pub pair_id: u32,
     pub asset_address: Pubkey,
     pub quote_mint: Pubkey,
-    pub current_price: u64,
+    pub current_price: u64, // scaled to 1_000_000 internal precision
     pub bull_mint: Pubkey,
     pub bear_mint: Pubkey,
     pub bull_vault: Pubkey,
     pub bear_vault: Pubkey,
+
+    // NEW: Chainlink oracle binding
+    pub chainlink_feed: Pubkey,
+    pub chainlink_program: Pubkey,
+
     pub protocol_fee: u64,
     pub mint_fee: u64,
     pub burn_fee: u64,
     pub pool_creator_fee: u64,
     pub pool_creator: Pubkey,
     pub pool_signer_bump: u8,
-}
-
-// Oracle feed account (placeholder / stand-in for Supra price feed data).
-#[account]
-pub struct OraclePriceFeedAccount {
-    pub pair_id: u32,
-    pub value: u128, // raw oracle value
-    pub decimals: u8, // decimal places on `value`
 }
 
 // === GLOBAL POOL REGISTRY ===
@@ -110,7 +120,7 @@ impl PoolRegistryAccount {
 pub struct UserPosition {
     pub pool: Pubkey,
     pub bull_avg_price: u64,
-    pub bear_avg_price: u64, 
+    pub bear_avg_price: u64,
 }
 
 #[account]
@@ -286,14 +296,28 @@ fn calculate_burn_amount(
     Ok(out)
 }
 
-// from oracle raw -> scaled price like your Move normalize_price()
-fn normalize_price(value: u128, decimals: u8, precision: u64) -> u64 {
+// Convert Chainlink price feed answer to our internal scaled u64 price (6 decimal places).
+fn normalize_chainlink_price(
+    answer: i128,
+    feed_decimals: u32,
+    precision: u64 // e.g. 1_000_000 to store price * 10^6
+) -> Result<u64> {
+    // Chainlink answers should be >= 0 for normal market pairs
+    require!(answer >= 0, PredictionError::ZeroPrice);
+
+    // cast safely
+    let unsigned_answer = answer as u128;
+
+    // compute 10^feed_decimals
     let mut divisor: u128 = 1;
-    for _ in 0..decimals {
+    for _ in 0..feed_decimals {
         divisor = divisor.saturating_mul(10);
     }
-    let scaled = value.saturating_mul(precision as u128).saturating_div(divisor);
-    scaled as u64
+
+    // scale into our precision
+    let scaled = unsigned_answer.saturating_mul(precision as u128).saturating_div(divisor);
+
+    Ok(scaled as u64)
 }
 
 // compute how pool should redistribute reserves based on price move
@@ -343,7 +367,7 @@ fn calculate_new_reserves(
     Ok((new_bull_reserve as u64, new_bear_reserve as u64))
 }
 
-// fee split logic (mirrors deduct_fees in Move)
+// fee split logic
 fn compute_fee_breakdown(
     amount: u64,
     protocol_fee_bps: u64,
@@ -379,13 +403,39 @@ fn compute_fee_breakdown(
 // called by multiple instructions to re-sync bull_vault/bear_vault if price moved
 fn do_rebalance<'info>(
     pool: &mut Account<'info, PoolAccount>,
-    oracle_feed: &Account<'info, OraclePriceFeedAccount>,
+
+    // NEW: Chainlink oracle accounts
+    chainlink_program: &UncheckedAccount<'info>,
+    chainlink_feed: &UncheckedAccount<'info>,
+
+    // vaults
     bull_vault: &Account<'info, TokenAccount>,
     bear_vault: &Account<'info, TokenAccount>,
+
+    // signer + token program
     pool_signer: &UncheckedAccount<'info>,
     token_program: &Program<'info, Token>
 ) -> Result<()> {
-    let new_price = normalize_price(oracle_feed.value, oracle_feed.decimals, 1_000_000);
+    // safety: enforce canonical oracle for this pool
+    require_keys_eq!(
+        chainlink_program.key(),
+        pool.chainlink_program,
+        PredictionError::Unauthorized
+    );
+    require_keys_eq!(chainlink_feed.key(), pool.chainlink_feed, PredictionError::Unauthorized);
+
+    // fetch latest Chainlink round data for this feed
+    let round = chainlink::latest_round_data(
+        chainlink_program.to_account_info(),
+        chainlink_feed.to_account_info()
+    )?;
+    let decimals = chainlink::decimals(
+        chainlink_program.to_account_info(),
+        chainlink_feed.to_account_info()
+    )?;
+
+    // normalize into our 6-decimal fixed point
+    let new_price = normalize_chainlink_price(round.answer, u32::from(decimals), 1_000_000)?;
 
     let old_price = pool.current_price;
     if new_price == old_price {
@@ -406,7 +456,7 @@ fn do_rebalance<'info>(
     let pool_key = pool.key();
     let signer_seeds: &[&[u8]] = &[b"pool_signer", pool_key.as_ref(), &[pool.pool_signer_bump]];
 
-    // move quote between vaults so final reserves match target split
+    // shift funds bear -> bull or bull -> bear to match new target split
     if target_bull > old_bull_reserve {
         // pull from bear_vault -> bull_vault
         let diff = target_bull - old_bull_reserve;
@@ -493,7 +543,7 @@ pub mod fate {
     // Initializes the PoolAccount, vaults, mints, sets fees, records pool in registry.
     // Does NOT move funds or mint initial bull/bear yet.
     pub fn init_pool(ctx: Context<InitPool>, args: InitPoolArgs) -> Result<()> {
-        // pool_creator must match payer (same assumption as Sui: creator collects creator_fee)
+        // pool_creator must match payer
         require_keys_eq!(
             ctx.accounts.pool_creator.key(),
             ctx.accounts.payer.key(),
@@ -513,13 +563,28 @@ pub mod fate {
         burn_fee = burn_fee.min(MAX_FEE);
         pool_creator_fee = pool_creator_fee.min(MAX_FEE);
 
-        // read oracle price
-        require!(ctx.accounts.oracle_feed.pair_id == args.pair_id, PredictionError::Unauthorized);
-        let initial_price = normalize_price(
-            ctx.accounts.oracle_feed.value,
-            ctx.accounts.oracle_feed.decimals,
-            1_000_000
+        // safety: supplied Chainlink program should be canonical
+        require_keys_eq!(
+            ctx.accounts.chainlink_program.key(),
+            chainlink_program_pubkey(),
+            PredictionError::Unauthorized
         );
+
+        // read initial price from Chainlink
+        let round = chainlink::latest_round_data(
+            ctx.accounts.chainlink_program.to_account_info(),
+            ctx.accounts.chainlink_feed.to_account_info()
+        )?;
+        let decimals = chainlink::decimals(
+            ctx.accounts.chainlink_program.to_account_info(),
+            ctx.accounts.chainlink_feed.to_account_info()
+        )?;
+
+        let initial_price = normalize_chainlink_price(
+            round.answer,
+            u32::from(decimals),
+            1_000_000
+        )?;
 
         let pool = &mut ctx.accounts.pool;
 
@@ -542,6 +607,10 @@ pub mod fate {
         pool.bull_vault = ctx.accounts.bull_vault.key();
         pool.bear_vault = ctx.accounts.bear_vault.key();
 
+        // bind oracle
+        pool.chainlink_feed = ctx.accounts.chainlink_feed.key();
+        pool.chainlink_program = ctx.accounts.chainlink_program.key();
+
         pool.protocol_fee = protocol_fee;
         pool.mint_fee = mint_fee;
         pool.burn_fee = burn_fee;
@@ -553,7 +622,7 @@ pub mod fate {
         // register pool globally
         ctx.accounts.registry.push_unique(pool.key());
 
-        // Emit creation event (even though no liquidity yet).
+        // Emit creation event
         emit!(PoolCreated {
             pool: pool.key(),
             name: pool.name.clone(),
@@ -576,7 +645,7 @@ pub mod fate {
 
         let pool = &mut ctx.accounts.pool;
 
-        // only the pool.creator can seed first liquidity in this version
+        // only the pool.creator can seed first liquidity
         require_keys_eq!(
             pool.pool_creator,
             ctx.accounts.payer.key(),
@@ -680,7 +749,7 @@ pub mod fate {
     }
 
     // === MANUAL REBALANCE ===
-    // Equivalent of Sui's `rebalance_pool_entry`: creator can poke oracle sync manually.
+    // Creator can manually poke oracle sync / reserve rebalance.
     pub fn rebalance_pool(ctx: Context<RebalancePool>) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
 
@@ -693,7 +762,8 @@ pub mod fate {
 
         do_rebalance(
             pool,
-            &ctx.accounts.oracle_feed,
+            &ctx.accounts.chainlink_program,
+            &ctx.accounts.chainlink_feed,
             &ctx.accounts.bull_vault,
             &ctx.accounts.bear_vault,
             &ctx.accounts.pool_signer,
@@ -744,7 +814,8 @@ pub mod fate {
         // rebalance before trading
         do_rebalance(
             pool,
-            &ctx.accounts.oracle_feed,
+            &ctx.accounts.chainlink_program,
+            &ctx.accounts.chainlink_feed,
             &ctx.accounts.bull_vault,
             &ctx.accounts.bear_vault,
             &ctx.accounts.pool_signer,
@@ -912,7 +983,8 @@ pub mod fate {
 
         do_rebalance(
             pool,
-            &ctx.accounts.oracle_feed,
+            &ctx.accounts.chainlink_program,
+            &ctx.accounts.chainlink_feed,
             &ctx.accounts.bull_vault,
             &ctx.accounts.bear_vault,
             &ctx.accounts.pool_signer,
@@ -1087,7 +1159,8 @@ pub mod fate {
         // rebalance before redemption
         do_rebalance(
             pool,
-            &ctx.accounts.oracle_feed,
+            &ctx.accounts.chainlink_program,
+            &ctx.accounts.chainlink_feed,
             &ctx.accounts.bull_vault,
             &ctx.accounts.bear_vault,
             &ctx.accounts.pool_signer,
@@ -1100,7 +1173,7 @@ pub mod fate {
             PredictionError::InsufficientBalance
         );
 
-        // can't burn 100% of supply -> same semantics as Move
+        // can't burn 100% of supply
         let total_supply_before = ctx.accounts.bull_mint.supply;
         require!(total_supply_before > 0, PredictionError::ZeroTotalSupply);
         require!(total_supply_before > amount_out_tokens, PredictionError::InvalidAmount);
@@ -1270,7 +1343,7 @@ pub mod fate {
             pool.bear_mint,
             PredictionError::Unauthorized
         );
-        // we also read seller_bull_ata to know if user exited fully
+        // also check seller_bull_ata to know if user exited fully
         require_keys_eq!(
             ctx.accounts.seller_bull_ata.mint,
             pool.bull_mint,
@@ -1279,7 +1352,8 @@ pub mod fate {
 
         do_rebalance(
             pool,
-            &ctx.accounts.oracle_feed,
+            &ctx.accounts.chainlink_program,
+            &ctx.accounts.chainlink_feed,
             &ctx.accounts.bull_vault,
             &ctx.accounts.bear_vault,
             &ctx.accounts.pool_signer,
@@ -1449,9 +1523,9 @@ pub struct InitPool<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 +
+        space = 8 + // discriminator
         4 +
-        64 + // name
+        64 + // name string prefix+data (Anchor: 4 + len)
         4 +
         256 + // description
         4 +
@@ -1462,20 +1536,22 @@ pub struct InitPool<'info> {
         32 + // bear_name
         4 +
         10 + // bear_symbol
-        4 + // pair_id
-        32 + // asset_address
-        32 + // quote_mint
-        8 + // current_price
-        32 + // bull_mint
-        32 + // bear_mint
-        32 + // bull_vault
-        32 + // bear_vault
-        8 +
-        8 +
-        8 +
-        8 + // fees
-        32 + // pool_creator
-        1 // pool_signer_bump
+        4 + // pair_id u32
+        32 + // asset_address Pubkey
+        32 + // quote_mint Pubkey
+        8 + // current_price u64
+        32 + // bull_mint Pubkey
+        32 + // bear_mint Pubkey
+        32 + // bull_vault Pubkey
+        32 + // bear_vault Pubkey
+        32 + // chainlink_feed Pubkey
+        32 + // chainlink_program Pubkey
+        8 + // protocol_fee u64
+        8 + // mint_fee u64
+        8 + // burn_fee u64
+        8 + // pool_creator_fee u64
+        32 + // pool_creator Pubkey
+        1 // pool_signer_bump u8
     )]
     pub pool: Account<'info, PoolAccount>,
 
@@ -1530,8 +1606,13 @@ pub struct InitPool<'info> {
     )]
     pub bear_vault: Account<'info, TokenAccount>,
 
-    // Oracle feed for this market pair
-    pub oracle_feed: Account<'info, OraclePriceFeedAccount>,
+    // NEW: Chainlink oracle feed account (e.g. SOL/USD feed)
+    /// CHECK: we only read it via Chainlink CPI, don't write to it
+    pub chainlink_feed: UncheckedAccount<'info>,
+
+    // NEW: Chainlink OCR2 program (must equal CHAINLINK_PROGRAM_ID_STR)
+    /// CHECK: verified in handler
+    pub chainlink_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -1622,7 +1703,11 @@ pub struct RebalancePool<'info> {
     #[account(mut)]
     pub bear_vault: Account<'info, TokenAccount>,
 
-    pub oracle_feed: Account<'info, OraclePriceFeedAccount>,
+    /// CHECK: Chainlink feed account (must match pool.chainlink_feed)
+    pub chainlink_feed: UncheckedAccount<'info>,
+
+    /// CHECK: Chainlink OCR2 program (must match pool.chainlink_program)
+    pub chainlink_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1674,7 +1759,11 @@ pub struct PurchaseBull<'info> {
     )]
     pub user_registry: Account<'info, UserRegistryAccount>,
 
-    pub oracle_feed: Account<'info, OraclePriceFeedAccount>,
+    /// CHECK: Chainlink feed (must equal pool.chainlink_feed)
+    pub chainlink_feed: UncheckedAccount<'info>,
+
+    /// CHECK: Chainlink OCR2 program (must equal pool.chainlink_program)
+    pub chainlink_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1688,7 +1777,7 @@ pub struct PurchaseBear<'info> {
     #[account(mut)]
     pub pool: Account<'info, PoolAccount>,
 
-    /// CHECK
+    /// CHECK: PDA signer
     #[account(seeds = [b"pool_signer", pool.key().as_ref()], bump = pool.pool_signer_bump)]
     pub pool_signer: UncheckedAccount<'info>,
 
@@ -1726,7 +1815,11 @@ pub struct PurchaseBear<'info> {
     )]
     pub user_registry: Account<'info, UserRegistryAccount>,
 
-    pub oracle_feed: Account<'info, OraclePriceFeedAccount>,
+    /// CHECK: Chainlink feed
+    pub chainlink_feed: UncheckedAccount<'info>,
+
+    /// CHECK: Chainlink OCR2 program
+    pub chainlink_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1740,7 +1833,7 @@ pub struct RedeemBull<'info> {
     #[account(mut)]
     pub pool: Account<'info, PoolAccount>,
 
-    /// CHECK
+    /// CHECK: PDA signer
     #[account(seeds = [b"pool_signer", pool.key().as_ref()], bump = pool.pool_signer_bump)]
     pub pool_signer: UncheckedAccount<'info>,
 
@@ -1784,7 +1877,11 @@ pub struct RedeemBull<'info> {
     )]
     pub user_registry: Account<'info, UserRegistryAccount>,
 
-    pub oracle_feed: Account<'info, OraclePriceFeedAccount>,
+    /// CHECK: Chainlink feed
+    pub chainlink_feed: UncheckedAccount<'info>,
+
+    /// CHECK: Chainlink OCR2 program
+    pub chainlink_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1798,7 +1895,7 @@ pub struct RedeemBear<'info> {
     #[account(mut)]
     pub pool: Account<'info, PoolAccount>,
 
-    /// CHECK
+    /// CHECK: PDA signer
     #[account(seeds = [b"pool_signer", pool.key().as_ref()], bump = pool.pool_signer_bump)]
     pub pool_signer: UncheckedAccount<'info>,
 
@@ -1842,7 +1939,11 @@ pub struct RedeemBear<'info> {
     )]
     pub user_registry: Account<'info, UserRegistryAccount>,
 
-    pub oracle_feed: Account<'info, OraclePriceFeedAccount>,
+    /// CHECK: Chainlink feed
+    pub chainlink_feed: UncheckedAccount<'info>,
+
+    /// CHECK: Chainlink OCR2 program
+    pub chainlink_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
